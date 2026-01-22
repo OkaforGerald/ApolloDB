@@ -4,7 +4,7 @@ using ApolloDB.Storage.Disk;
 
 namespace ApolloDB.Storage.Buffer;
 
-public class BufferPoolManager
+public class BufferPoolManager : IAsyncDisposable
 {
     const int MAX_BUFFER_SIZE = 128;
     const int FRAME_SIZE = 8192;
@@ -33,7 +33,7 @@ public class BufferPoolManager
         _pageTable = new ConcurrentDictionary<PageId, int>();
         _replacer = new ArcReplacer(MAX_BUFFER_SIZE);
         _freePageIndices = new ConcurrentQueue<int>(Enumerable.Range(0, MAX_BUFFER_SIZE));
-        _diskScheduler = new DiskScheduler(new DiskManager());
+        _diskScheduler = new DiskScheduler(new DiskManager(new CatalogManager()));
     }
 
     public class Frame
@@ -51,12 +51,12 @@ public class BufferPoolManager
         if (_pageTable.TryGetValue(pageId, out var frameIdx))
         {
             var frame = _frames[frameIdx];
-            
+
             frame.Latch.EnterWriteLock();
-            if(frame.PinCount > 0) return false;
+            if (frame.PinCount > 0) return false;
             _replacer.SetEvictable(pageId, true);
             frame.Latch.ExitWriteLock();
-            
+
             var request = new DiskRequest
             {
                 Operation = DiskOperation.Write,
@@ -65,10 +65,12 @@ public class BufferPoolManager
                 Tcs = new TaskCompletionSource<bool>(),
             };
             await _diskScheduler.ScheduleAsync(request);
-            await request.Tcs.Task;  
-            
+            await request.Tcs.Task;
+
             _freePageIndices.Enqueue(frameIdx);
             _pageTable.TryRemove(pageId, out _);
+
+            return true;
         }
 
         return false;
@@ -104,7 +106,7 @@ public class BufferPoolManager
                     {
                         await FlushPageAsync(victimPageId.Value);
                     }
-                    
+
                     _pageTable.TryRemove(victimPageId.Value, out _);
                     targetFrameIdx = victimFrameIdx;
                 }
@@ -114,10 +116,10 @@ public class BufferPoolManager
                 }
             }
         }
+
         if (targetFrameIdx.HasValue)
         {
             frame = _frames[targetFrameIdx.Value];
-            frame.Latch.EnterWriteLock();
             if (!isInMemory)
             {
                 var request = new DiskRequest
@@ -128,13 +130,22 @@ public class BufferPoolManager
                     Tcs = new TaskCompletionSource<bool>(),
                 };
                 await _diskScheduler.ScheduleAsync(request);
-                await request.Tcs.Task; 
+                await request.Tcs.Task;
                 _pageTable.TryAdd(pageId, targetFrameIdx.Value);
             }
-            frame.PinCount++;
-            _replacer.RecordAccess(pageId);
-            _replacer.SetEvictable(pageId, false);
-            frame.Latch.ExitWriteLock();
+
+            try
+            {
+                frame.Latch.EnterWriteLock();
+
+                frame.PinCount++;
+                _replacer.RecordAccess(pageId);
+                _replacer.SetEvictable(pageId, false);
+            }
+            finally
+            {
+                frame.Latch.ExitWriteLock();   
+            }
 
             return frame;
         }
@@ -143,7 +154,7 @@ public class BufferPoolManager
             throw new InvalidOperationException("Failed to obtain frame");
         }
     }
-    
+
     public void UnpinPage(PageId pageId, bool isDirty)
     {
         if (!_pageTable.TryGetValue(pageId, out var frameIdx))
@@ -152,19 +163,19 @@ public class BufferPoolManager
         }
 
         var frame = _frames[frameIdx];
-    
+
         frame.Latch.EnterWriteLock();
         try
         {
             if (frame.PinCount > 0)
             {
                 frame.PinCount--;
-            
+
                 if (isDirty)
                 {
                     frame.IsDirty = true;
                 }
-                
+
                 if (frame.PinCount == 0)
                 {
                     _replacer.SetEvictable(pageId, true);
@@ -177,19 +188,55 @@ public class BufferPoolManager
         }
     }
 
-    public async Task FlushPageAsync(PageId pageId)
+    public async Task<bool> FlushPageAsync(PageId pageId)
     {
+        Frame frame;
+        int? targetFrameIdx;
+        if (_pageTable.TryGetValue(pageId, out var pageIdx))
+        {
+            targetFrameIdx = pageIdx;
+        }
+        else
+        {
+            return false;
+        }
+
+        frame = _frames[targetFrameIdx.Value];
+        var request = new DiskRequest
+        {
+            Operation = DiskOperation.Flush,
+            PageId = pageId,
+            Data = _frames[targetFrameIdx.Value].Data,
+            Tcs = new TaskCompletionSource<bool>(),
+        };
+            
+        await _diskScheduler.ScheduleAsync(request);
+        await request.Tcs.Task;
+
+        frame.Latch.EnterWriteLock();
+        try
+        {
+            if (!frame.IsDirty) return true;
+            frame.IsDirty = false;
+            return true;
+        }
+        finally
+        {
+            frame.Latch.ExitWriteLock();
+        }
     }
 
     public async Task FlushAllPages()
     {
+        var tasks = _pageTable.Keys.Select(FlushPageAsync).ToArray();
+        await Task.WhenAll(tasks);
     }
 
     public uint GetPinCount(PageId pageId)
     {
         if (!_pageTable.TryGetValue(pageId, out var frameIdx))
             return 0;
-        
+
         var frame = _frames[frameIdx];
         frame.Latch.EnterReadLock();
         try
@@ -199,6 +246,19 @@ public class BufferPoolManager
         finally
         {
             frame.Latch.ExitReadLock();
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await FlushAllPages();
+        
+        await _diskScheduler.DisposeAsync();
+        
+        foreach (var frame in _frames)
+        {
+            _bytePool.Return(frame.Data);
+            frame.Latch.Dispose();
         }
     }
 }

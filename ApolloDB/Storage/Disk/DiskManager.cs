@@ -1,62 +1,83 @@
+using System.Collections.Concurrent;
 using ApolloDB.Storage.Buffer;
+using Microsoft.Win32.SafeHandles;
 
 namespace ApolloDB.Storage.Disk;
 
-public class DiskManager
+public class DiskManager : IAsyncDisposable
 {
-    const int FRAME_SIZE = 8192;
-    private CatalogManager _catalogManager = new CatalogManager();
-
-    private FileStreamOptions _writeStreamOptions = new()
+    private const int FRAME_SIZE = 8192;
+    private readonly CatalogManager _catalogManager;
+    private readonly ConcurrentDictionary<uint, SafeFileHandle> _openFiles;
+    private readonly SemaphoreSlim _fileOpenLock = new SemaphoreSlim(1, 1);
+    
+    public DiskManager(CatalogManager catalogManager)
     {
-        BufferSize = FRAME_SIZE,
-        Access = FileAccess.Write,
-        Mode = FileMode.Open,
-        Options = FileOptions.WriteThrough | FileOptions.RandomAccess // Direct IO and Yeah
-    };
-
-    private FileStreamOptions _readStreamOptions = new()
-    {
-        BufferSize = FRAME_SIZE,
-        Access = FileAccess.Read,
-        Mode = FileMode.Open,
-        Options = FileOptions.RandomAccess
-    };
+        _catalogManager = catalogManager;
+        _openFiles = new ConcurrentDictionary<uint, SafeFileHandle>();
+    }
     
     public async Task WritePageAsync(PageId pageId, byte[] data)
     {
-        if (data.Length != FRAME_SIZE)
-            throw new ArgumentException($"Data must be exactly {FRAME_SIZE} bytes", nameof(data));
-
-        var fileHandle = _catalogManager.GetFile(pageId.FileId);
-    
-        using (var fStream = File.Open(fileHandle.FilePath, _writeStreamOptions))
-        {
-            fStream.Seek((long)(FRAME_SIZE * pageId.PageNumber), SeekOrigin.Begin);
-            await fStream.WriteAsync(data, 0, data.Length);
-            await fStream.FlushAsync();
-        }
+        var handle = await GetOrOpenFileAsync(pageId.FileId);
+        var offset = (long)pageId.PageNumber * FRAME_SIZE;
+        
+        await RandomAccess.WriteAsync(handle, data, offset);
     }
 
     public async Task ReadPageAsync(PageId pageId, byte[] buffer)
     {
-        if (buffer.Length != FRAME_SIZE)
-            throw new ArgumentException($"Buffer must be exactly {FRAME_SIZE} bytes", nameof(buffer));
+        var handle = await GetOrOpenFileAsync(pageId.FileId);
+        var offset = (long)pageId.PageNumber * FRAME_SIZE;
 
-        var fileHandle = _catalogManager.GetFile(pageId.FileId);
-    
-        using (var fStream = File.Open(fileHandle.FilePath, _readStreamOptions))
-        {
-            fStream.Seek((long)(FRAME_SIZE * pageId.PageNumber), SeekOrigin.Begin);
+        var bytesRead = await RandomAccess.ReadAsync(handle, buffer, offset);
         
-            int totalRead = 0;
-            while (totalRead < buffer.Length)
-            {
-                int bytesRead = await fStream.ReadAsync(buffer, totalRead, buffer.Length - totalRead);
-                if (bytesRead == 0)
-                    throw new EndOfStreamException($"Unexpected end of file when reading page {pageId}");
-                totalRead += bytesRead;
-            }
+        if (bytesRead < buffer.Length)
+        {
+            Array.Clear(buffer, bytesRead, buffer.Length - bytesRead);
         }
+    }
+
+    public async Task FlushAsync(PageId pageId)
+    {
+        var handle = await GetOrOpenFileAsync(pageId.FileId);
+        
+        RandomAccess.FlushToDisk(handle);
+    }
+
+    private async Task<SafeFileHandle> GetOrOpenFileAsync(uint fileId)
+    {
+        SafeFileHandle safeHandle;
+        if (_openFiles.TryGetValue(fileId, out var handle))
+            return handle;
+
+        try
+        {
+            await _fileOpenLock.WaitAsync();
+            var fileHandle = _catalogManager.GetFile(fileId);
+
+            safeHandle = File.OpenHandle(
+                fileHandle.FilePath,
+                FileMode.OpenOrCreate,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                FileOptions.RandomAccess | FileOptions.Asynchronous
+            );
+        }
+        finally
+        {
+            _fileOpenLock.Release();
+        }
+        
+        _openFiles[fileId] = safeHandle;
+        return safeHandle;
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        foreach (var handle in _openFiles.Values)
+            handle.Dispose();
+        _fileOpenLock.Dispose();
+        return ValueTask.CompletedTask;
     }
 }

@@ -6,7 +6,11 @@ public class CatalogManager
 {
     private readonly ConcurrentDictionary<uint, FileHandle> _files;
     private uint _nextFileId = 0;
-    
+
+    public CatalogManager()
+    {
+        _files = new ConcurrentDictionary<uint, FileHandle>();
+    }
     public class FileHandle
     {
         public uint FileId { get; }

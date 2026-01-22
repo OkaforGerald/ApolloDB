@@ -50,6 +50,10 @@ public class DiskScheduler : IAsyncDisposable
                         await _diskManager.ReadPageAsync(request.PageId, request.Data);
                         request.Tcs.TrySetResult(true);
                         break;
+                    case DiskOperation.Flush:
+                        await _diskManager.FlushAsync(request.PageId);
+                        request.Tcs.TrySetResult(true);
+                        break;
                 }
             }
             catch (Exception ex)
@@ -80,7 +84,8 @@ public class DiskScheduler : IAsyncDisposable
 public enum DiskOperation
 {
     Read,
-    Write
+    Write,
+    Flush
 }
 
 public readonly struct DiskRequest
