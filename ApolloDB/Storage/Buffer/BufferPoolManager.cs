@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using ApolloDB.Storage.Disk;
+using ApolloDB.Storage.Page;
 
 namespace ApolloDB.Storage.Buffer;
 
@@ -36,15 +37,6 @@ public class BufferPoolManager : IAsyncDisposable
         _diskScheduler = new DiskScheduler(new DiskManager(new CatalogManager()));
     }
 
-    public class Frame
-    {
-        public byte[] Data { get; set; }
-        public PageId PageId { get; set; }
-        public uint PinCount { get; set; }
-        public bool IsDirty { get; set; }
-        public ReaderWriterLockSlim Latch { get; } = new();
-    }
-
     // Removes a page from the database, both on disk and in memory.
     public async Task<bool> DeletePage(PageId pageId)
     {
@@ -53,7 +45,11 @@ public class BufferPoolManager : IAsyncDisposable
             var frame = _frames[frameIdx];
 
             frame.Latch.EnterWriteLock();
-            if (frame.PinCount > 0) return false;
+            if (frame.PinCount > 0)
+            {
+                frame.Latch.ExitWriteLock();
+                return false;
+            }
             _replacer.SetEvictable(pageId, true);
             frame.Latch.ExitWriteLock();
 
@@ -260,27 +256,5 @@ public class BufferPoolManager : IAsyncDisposable
             _bytePool.Return(frame.Data);
             frame.Latch.Dispose();
         }
-    }
-}
-
-public readonly struct PageId : IEquatable<PageId>
-{
-    public uint FileId { get; }
-    public uint PageNumber { get; }
-
-    public PageId(uint fileId, uint pageNumber)
-    {
-        FileId = fileId;
-        PageNumber = pageNumber;
-    }
-
-    public override int GetHashCode()
-    {
-        return HashCode.Combine(FileId, PageNumber);
-    }
-
-    public bool Equals(PageId other)
-    {
-        return FileId == other.FileId && PageNumber == other.PageNumber;
     }
 }

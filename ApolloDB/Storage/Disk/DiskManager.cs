@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using ApolloDB.Storage.Buffer;
+using ApolloDB.Storage.Page;
 using Microsoft.Win32.SafeHandles;
 
 namespace ApolloDB.Storage.Disk;

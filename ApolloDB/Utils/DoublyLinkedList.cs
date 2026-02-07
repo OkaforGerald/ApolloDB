@@ -26,6 +26,7 @@ public class DoublyLinkedList<T>
         {
             obj.Next = obj.Previous = null;
             obj.Value = default;
+            obj.IsEvictable = false;
             return true;
         }
     }

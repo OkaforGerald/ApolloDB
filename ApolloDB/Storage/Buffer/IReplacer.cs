@@ -1,3 +1,5 @@
+using ApolloDB.Storage.Page;
+
 namespace ApolloDB.Storage.Buffer;
 
 public interface IReplacer
