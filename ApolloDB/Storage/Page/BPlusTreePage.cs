@@ -6,7 +6,7 @@ namespace ApolloDB.Storage.Page;
 /// Record Identifier - points to a specific tuple in a page.
 /// </summary>
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
-public readonly struct Rid
+public readonly struct Rid : IEquatable<Rid>
 {
     public readonly uint PageNumber;
     public readonly ushort SlotNumber;
@@ -19,6 +19,15 @@ public readonly struct Rid
 
     public static readonly Rid Invalid = new(uint.MaxValue, ushort.MaxValue);
     public bool IsValid => PageNumber != uint.MaxValue;
+    
+    public override int GetHashCode()
+    {
+        return HashCode.Combine(PageNumber, SlotNumber);
+    }
+    public bool Equals(Rid other)
+    {
+        return PageNumber == other.PageNumber && SlotNumber == other.SlotNumber;
+    }
 }
 
 /// <summary>
@@ -194,6 +203,19 @@ public ref struct BPlusTreeLeafPage
         slots[insertIdx] = newSlotValue;
 
         return true;
+    }
+
+    public void Delete(int index)
+    {
+        if (index < 0 || index >= KeyCount)
+            throw new ArgumentOutOfRangeException(nameof(index));
+
+        var slots = GetSlotArray();
+        for (int i = index; i < slots.Length - 1; i++)
+            slots[i] = slots[i + 1];
+
+        ref var header = ref GetHeader();
+        header.PG_LOWER_OFFSET -= sizeof(ushort);
     }
 
     public uint GetNextLeaf()
@@ -403,4 +425,12 @@ public ref struct BPlusTreeInternalPage
 
         return true;
     }
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public struct BPlusTreeHeaderPage
+{
+    public uint RootPageId;
+    public uint NextPageNumber;
+    // Will think up the rest later
 }

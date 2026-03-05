@@ -10,6 +10,8 @@ public struct PageHeader
     public ushort PG_LOWER_OFFSET; // Offset to start of free space
     public ushort PG_UPPER_OFFSET; // Offset to end of free space
     public ushort PG_SPECIAL;
+
+    public const int Size = 7;
 }
 
 public static class PageExtensions

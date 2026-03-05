@@ -15,6 +15,7 @@ public class BufferPoolManager : IAsyncDisposable
     private readonly DiskScheduler _diskScheduler;
     private readonly ArrayPool<byte> _bytePool;
     private readonly ConcurrentQueue<int> _freePageIndices;
+    private readonly PageAllocator _allocator;
 
     public BufferPoolManager()
     {
@@ -34,10 +35,10 @@ public class BufferPoolManager : IAsyncDisposable
         _pageTable = new ConcurrentDictionary<PageId, int>();
         _replacer = new ArcReplacer(MAX_BUFFER_SIZE);
         _freePageIndices = new ConcurrentQueue<int>(Enumerable.Range(0, MAX_BUFFER_SIZE));
-        _diskScheduler = new DiskScheduler(new DiskManager(new CatalogManager()));
+        _allocator = new PageAllocator();
+        _diskScheduler = new DiskScheduler(new DiskManager(new CatalogManager())); // Work on this later
     }
-
-    // Removes a page from the database, both on disk and in memory.
+    
     public async Task<bool> DeletePage(PageId pageId)
     {
         if (_pageTable.TryGetValue(pageId, out var frameIdx))
@@ -70,6 +71,59 @@ public class BufferPoolManager : IAsyncDisposable
         }
 
         return false;
+    }
+
+    public async Task<Frame> AllocatePage(uint fileId)
+    {
+        int targetFrameIdx;
+        Frame frame;
+        var freePageIndex = _allocator.AllocatePage(fileId);
+
+        if (_freePageIndices.TryDequeue(out var frameIdx))
+        {
+            targetFrameIdx = frameIdx;
+        }
+        else
+        {
+            var victimPageId = _replacer.Evict();
+            if (victimPageId.HasValue)
+            {
+                var victimFrameIdx = _pageTable[victimPageId.Value];
+                var victimFrame = _frames[victimFrameIdx];
+
+                if (victimFrame.IsDirty)
+                {
+                    await FlushPageAsync(victimPageId.Value);
+                }
+
+                _pageTable.TryRemove(victimPageId.Value, out _);
+                targetFrameIdx = victimFrameIdx;
+            }
+            else
+            {
+                throw new InvalidOperationException("All frames in memory have been pinned");
+            }
+        }
+
+        frame = _frames[targetFrameIdx];
+        try
+        {
+            var pageId = new PageId(fileId, (uint)freePageIndex);
+            frame.Latch.EnterWriteLock();
+
+            frame.PageId = pageId;
+            Array.Clear(frame.Data, 0, frame.Data.Length);
+            frame.PinCount++;
+            _replacer.RecordAccess(pageId);
+            _replacer.SetEvictable(pageId, false);
+            _pageTable.TryAdd(pageId, targetFrameIdx);
+        }
+        finally
+        {
+            frame.Latch.ExitWriteLock();   
+        }
+
+        return frame;
     }
 
     public async Task<Frame> ReadPage(PageId pageId)
